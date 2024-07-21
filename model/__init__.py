@@ -116,8 +116,8 @@ class SplineModel(nn.Module):
         num_points_u = num_points_v = self._res
         degree_u = self._degrees_u[patch_id]
         degree_v = self._degrees_v[patch_id]
-        knots_u = self._knots_u[patch_id] + patch_id*2
-        knots_v = self._knots_v[patch_id] + patch_id*2 + 1
+        knots_u = self._knots_u[patch_id] #+ patch_id*2
+        knots_v = self._knots_v[patch_id] #+ patch_id*2 + 1
         u_values = torch.linspace(knots_u[degree_u], knots_u[-degree_u - 1], num_points_u)
         v_values = torch.linspace(knots_v[degree_v], knots_v[-degree_v - 1], num_points_v)
 
