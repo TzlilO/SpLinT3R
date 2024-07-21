@@ -3,10 +3,13 @@ import torch
 import torch.nn as nn
 from plyfile import PlyElement, PlyData
 from torch.nn import functional as F
-from .spline_utils import to_quaternions, b_spline_basis_functions_and_derivatives, patch_subdivision, \
-    normalize_point_cloud, compute_scale_factors, \
-    DecayingCosineAnnealingWarmRestarts, inverse_sigmoid, Gaussians, plot_lr_schedule, quaternion_from_two_vectors, \
-    analyze_gradient_trend, analyze_gradient_trend_per_patch, patch_subdivisions, SH_interpolation
+
+from .schedulers import DecayingCosineAnnealingWarmRestarts
+from .schedulers.utils import plot_lr_schedule
+from .spline_utils import b_spline_basis_functions_and_derivatives, \
+    normalize_point_cloud, \
+    inverse_sigmoid, Gaussians, quaternion_from_two_vectors, analyze_gradient_trend_per_patch, patch_subdivisions, SH_interpolation, \
+    catmull_clark_subdivision, evaluate_bspline_surface
 import os
 
 RESCALING_UP = 2.
@@ -14,7 +17,7 @@ RESCALING_DOWN = .9
 
 
 class SplineModel(nn.Module):
-    def __init__(self, patches, device='cuda', resolution=16, debug=False, splitting_interval_every=1000, step_size=1):
+    def __init__(self, patches, device='cuda', resolution=16, debug=False, splitting_interval_every=500, step_size=1):
         super(SplineModel, self).__init__()
         self.step_size = step_size
         self.splitting_interval_every = splitting_interval_every
@@ -73,6 +76,13 @@ class SplineModel(nn.Module):
         self.set_surface_data()
         self.training_setup()
 
+        # self.uniform_split = torch.eye(4) * torch.tensor([1 / 8, 1 / 4, 1 / 2, 1], device=device, dtype=torch.float32, requires_grad=True)
+        # self.basis = 1/6*torch.tensor([[-1, 3, -3, 1],
+        #                                [3, -6, 3, 0],
+        #                                [-3, 0, 3, 0],
+        #                                [1, 4, 1, 0]], device=device, dtype=torch.float32, requires_grad=True)
+
+
     def set_surface_data(self):
         # TODO: Check if that's correct and if so, reduce to 1-tensor 'fits them all' instead of (num_patches * tensors)
 
@@ -120,10 +130,13 @@ class SplineModel(nn.Module):
         knots_v = self._knots_v[patch_id] #+ patch_id*2 + 1
         u_values = torch.linspace(knots_u[degree_u], knots_u[-degree_u - 1], num_points_u)
         v_values = torch.linspace(knots_v[degree_v], knots_v[-degree_v - 1], num_points_v)
-
+        # U = torch.cat([u_values ** 3, u_values ** 2, u_values, u_values ** 0], dim=1).to('cuda')
+        # V = torch.cat([v_values ** 3, v_values ** 2, v_values, v_values ** 0], dim=1).to('cuda')
         self.b_u_tensor[patch_id], self.db_u_tensor[patch_id],  self.ddb_u_tensor[patch_id] = b_spline_basis_functions_and_derivatives(degree_u, knots_u.cpu(), u_values, device)
         self.b_v_tensor[patch_id], self.db_v_tensor[patch_id],  self.ddb_v_tensor[patch_id] = b_spline_basis_functions_and_derivatives(degree_v, knots_v.cpu(), v_values, device)
-
+        # xyzs = evaluate_bspline_surface(self.control_points[patch_id], u_values, v_values)
+        #
+        # upsampled = catmull_clark_subdivision(self.control_points)
         self.U_tensors = torch.stack([self.b_u_tensor, self.db_u_tensor, self.ddb_u_tensor])
         self.V_tensors = torch.stack([self.b_v_tensor, self.db_v_tensor, self.ddb_v_tensor])
         self.sh_features = torch.concatenate([self.spherical_harmonics_dc, self.spherical_harmonics_rest], dim=-2)
@@ -320,7 +333,8 @@ class SplineModel(nn.Module):
 
         # Prepare updated parameters values
         new_sh =SH_interpolation(features_to_optimize)
-        splitted_control_points = patch_subdivisions(control_points_to_optimize)
+        # splitted_control_points = patch_subdivisions(control_points_to_optimize)
+        splitted_control_points = catmull_clark_subdivision(control_points_to_optimize)
         new_control_points = torch.cat((old_control_points, splitted_control_points)).contiguous()
         new_nurbs_weights = torch.cat((self.nurbs_weights[~do_upsampling_mask], self.nurbs_weights[do_upsampling_mask].repeat_interleave(4, dim=0))).contiguous()
         sph_harm_features = torch.cat((features_other, new_sh))
