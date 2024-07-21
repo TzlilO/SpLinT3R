@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/ceph/hpc/home/eutzlilo/SplineSplatting/experiments/tpot3', model_path='./output/093ba637-e', images='images', resolution=2, white_background=False, data_device='cuda', eval=True)

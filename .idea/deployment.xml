@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="eutzlilo@logingpu.vega.izum.si:22 key" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+    <option name="confirmBeforeUploading" value="false" />
+    <serverData>
+      <paths name="Splines">
+        <serverdata>
+          <mappings>
+            <mapping local="" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="eutzlilo@logingpu.vega.izum.si:22 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/ceph/hpc/home/eutzlilo/SplineSplatting/" local="$PROJECT_DIR$" web="/" />
+            <mapping local="" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="eutzlilo@logingpu.vega.izum.si:22 agent (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/ceph/hpc/home/eutzlilo/SplineSplatting/" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="eutzlilo@logingpu.vega.izum.si:22 key">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/ceph/hpc/home/eutzlilo/SplineSplatting/" local="$PROJECT_DIR$" web="/" />
+            <mapping local="" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
