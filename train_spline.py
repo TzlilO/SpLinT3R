@@ -70,12 +70,11 @@ def render_scene(scene, gaussians, pipe, bg, iteration=None):
 def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint_iterations, debug_from):
     first_iter = 0
     device = 'cuda'
-
     # Load Spline reference scene
     file_path = 'experiments/bpt-data/teapot.txt'
     file_content = read_bpt_file(file_path)
     patches = parse_bpt(file_content)
-    splines = SplineModel(patches, device=device, resolution=16)
+    splines = SplineModel(patches, device=device, resolution=6)
 
     tb_writer = prepare_output_and_logger(dataset)
     scene = SplineScene(dataset, splines)
@@ -96,7 +95,7 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
-        if iteration in [2500, 5000, 8500, 10000, 12500]:
+        if iteration in [3500, 6000, 9000, 12000]:
             splines.oneupSHdegree()
 
         # Pick a random Camera
@@ -116,15 +115,15 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint
         gt_image = viewpoint_cam.original_image.cuda()
 
         Ll1 = l1_loss(image, gt_image)
-        # L_geo = pw_cosine_similarity(splines.surface_normals, splines.areas, weight=0.1)
+        # L_geo = pw_cosine_similarity(splines.surface_normals, splines.areas, weight=.1)
         ssim_term = (1.0 - ssim(image, gt_image))
-        loss += ((1 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_term)
+        loss += ((1 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_term) #+ L_geo
 
         if not iteration % step_interval:
             loss.backward()
             splines.step(iteration, visibility_filter)
             loss = torch.tensor([0], dtype=torch.float32, device="cuda")
-            if iteration % splines.splitting_interval_every == 0 and  iteration <= 6000:
+            if iteration % splines.splitting_interval_every == 0 and iteration <= 7000:
                 splines.patch_upsampler()
             splines.sample_gaussians()
         iter_end.record()
