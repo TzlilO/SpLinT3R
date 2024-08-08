@@ -156,8 +156,11 @@ class SplineScene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.splines.export_gaussians_ply(os.path.join(point_cloud_path, "points3d.ply"))
 
-    def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
+    def getTrainCameras(self, scale=1.0, num_cameras=None):
+        if not num_cameras:
+            return self.train_cameras[scale]
+
+        return self.train_cameras[scale][:num_cameras]
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]

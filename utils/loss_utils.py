@@ -129,7 +129,7 @@ def compute_cosine_similarity(grad_tensor):
     return cosine_similarity
 
 
-def pw_cosine_similarity(surface_normals, areas, weight=1):
+def geometry_loss(surface_normals, areas, weight=1):
     """
     Computes the cosine similarity between nearby normals on a surface per patch.
 
@@ -153,3 +153,47 @@ def pw_cosine_similarity(surface_normals, areas, weight=1):
 
     loss = (loss_u + loss_v) / areas  # patches with larger area will be weighted less
     return loss.mean() * weight
+
+
+def TV_SH_loss(sh_coeffs):
+    """
+    Compute the total variation (TV) loss for spherical harmonics coefficients.
+
+    Parameters:
+        sh_coeffs (torch.Tensor): Tensor of shape (B, 4, 4, C) representing the SH coefficients of the surface patches.
+
+    Returns:
+        torch.Tensor: Total variation loss.
+    """
+    B, udim, vdim, C = sh_coeffs.shape
+
+    # Compute finite differences along u and v directions
+    delta_u_sh = sh_coeffs[:, 1:, :, :] - sh_coeffs[:, :-1, :, :]
+    delta_v_sh = sh_coeffs[:, :, 1:, :] - sh_coeffs[:, :, :-1, :]
+
+    # Compute the total variation loss
+    tv_loss_u = torch.sum(torch.sqrt(torch.sum(delta_u_sh ** 2, dim=-1) + 1e-6))
+    tv_loss_v = torch.sum(torch.sqrt(torch.sum(delta_v_sh ** 2, dim=-1) + 1e-6))
+
+    tv_loss = tv_loss_u + tv_loss_v
+
+    return tv_loss / (B * udim * vdim * C)
+
+
+def TV_loss(du, dv):
+    """
+    Compute the total variation (TV) loss for spline surface patches.
+
+    Parameters:
+        control_points (torch.Tensor): Tensor of shape (B, 4, 4, 3) representing the control points of the surface patches.
+
+    Returns:
+        torch.Tensor: Total variation loss.
+    """
+    B, udim, vdim, _ = du.shape
+
+
+    # Compute the total variation loss
+    tv_loss = torch.sum(torch.sqrt(du ** 2 + 1e-6)) + torch.sum(torch.sqrt(dv ** 2 + 1e-6))
+
+    return tv_loss / (B * udim * vdim)
