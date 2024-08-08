@@ -1,98 +1,11 @@
 import torch
 from typing import NamedTuple
+
+import wandb
 from matplotlib import pyplot as plt
 import torch.nn.functional as F
 from scipy.special import comb
 
-#
-# def compute_face_points(xyz):
-#     return (xyz[:, :-1, :-1] + xyz[:, :-1, 1:] + xyz[:, 1:, :-1] + xyz[:, 1:, 1:]) * 0.25
-#
-#
-# def compute_edge_points(xyz, face_points):
-#     edge_points = torch.zeros_like(xyz)
-#     edge_points[:, :-1, :] += 0.5 * (xyz[:, :-1, :] + xyz[:, 1:, :])
-#     edge_points[:, 1:, :] += 0.5 * (xyz[:, :-1, :] + xyz[:, 1:, :])
-#     edge_points[:, :, :-1] += 0.5 * (xyz[:, :, :-1] + xyz[:, :, 1:])
-#     edge_points[:, :, 1:] += 0.5 * (xyz[:, :, :-1] + xyz[:, :, 1:])
-#     edge_points[:, 1:-1, 1:-1] += 0.25 * (face_points[:, :-1, :] + face_points[:, 1:, :])
-#     return edge_points * 0.5
-#
-#
-# def compute_vertex_points(xyz, face_points, edge_points):
-#     vertex_points = torch.zeros_like(xyz)
-#     vertex_points += xyz
-#     vertex_points[:, :-1, :-1] += face_points
-#     vertex_points[:, 1:, :-1] += face_points
-#     vertex_points[:, :-1, 1:] += face_points
-#     vertex_points[:, 1:, 1:] += face_points
-#     vertex_points[:, 1:-1, 1:-1] += edge_points[:, 1:-1, 1:-1]
-#     return vertex_points * 0.25
-#
-#
-# def catmull_clark_subdivision(xyz):
-#     """
-#     Given a BSpline patch (N patches in total), where each patch is defined by 4x4 3D control points,
-#     this function returns 4 new patches for each of the N patches using the Catmull-Clark subdivision algorithm.
-#
-#     Parameters:
-#         xyz (torch.Tensor): Tensor of shape (N, 4, 4, 3) representing control points in 3D.
-#
-#     Returns:
-#         torch.Tensor: Subdivided 4 new patches of the old patch according to its 3D control points tensor of shape (4N, 4, 4, 3).
-#     """
-#     face_points = compute_face_points(xyz)
-#     edge_points = compute_edge_points(xyz, face_points)
-#     vertex_points = compute_vertex_points(xyz, face_points, edge_points)
-#
-#     # Initialize new grid with zeros
-#     new_grid = torch.zeros((xyz.shape[0], 7, 7, 3), dtype=xyz.dtype, device=xyz.device)
-#
-#     # Place original values into the new tensor
-#     new_grid[:, 0::2, 0::2] = vertex_points
-#
-#     # Place row midpoints
-#     new_grid[:, 1::2, 0::2] = edge_points[:, :-1, :]
-#     new_grid[:, 1::2, 1::2] = face_points[:, :, :]
-#
-#     # Place column midpoints
-#     new_grid[:, 0::2, 1::2] = edge_points[:, :, :-1]
-#
-#     # Place center midpoints
-#     new_grid[:, 1::2, 1::2] = edge_points[:, 1:, 1:]
-#
-#     # Extract 4 new patches from the new grid
-#     patches = []
-#     for i in range(2):
-#         for j in range(2):
-#             patches.append(new_grid[:, i * 3:(i + 1) * 3 + 1, j * 3:(j + 1) * 3 + 1])
-#
-#     return torch.cat(patches, dim=0)
-#
-#
-# def evaluate_bspline_surface(control_points, u, v):
-#     """
-#     Evaluate the B-Spline surface point S(u, v) given the control points.
-#
-#     Parameters:
-#         control_points (torch.Tensor): Tensor of shape (4, 4, 3) representing 4x4 control points in 3D.
-#         u (float): The u parameter in [0, 1].
-#         v (float): The v parameter in [0, 1].
-#
-#     Returns:
-#         torch.Tensor: The surface point S(u, v) of shape (3,).
-#     """
-#
-#     def bernstein_poly(i, n, t):
-#         return comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
-#
-#     def basis_functions(n, t):
-#         return torch.cat([bernstein_poly(i, n, t).unsqueeze(0) for i in range(n + 1)], dim=0)
-#
-#     Bu = basis_functions(3, u).reshape(-1, 4, 4).to('cuda')
-#     Bv = basis_functions(3, v).reshape(-1, 4, 4).to('cuda')
-#     return torch.tensordot(Bu, torch.tensordot(Bv, control_points, dims=([1], [1])), dims=([0], [0]))
-#
 
 def bernstein_poly(i, n, t, device='cuda'):
     return torch.tensor(comb(n, i) * (t ** i) * ((1 - t) ** (n - i)), device=device)
@@ -376,10 +289,199 @@ def normalize_point_cloud(points):
 
     return normalized_points
 
+def analyze_gradient_trend_per_patch(gradients, window_size=32, top_k=5, tolerance=1e-12, device='cuda', param_group_name='', lr=0, epsilon=1e-6):
+    # Aggregate gradients across all dimensions except BATCH and PATCHES
+    if gradients.dim() == 5:  # Case A
+        agg_gradients = gradients.abs().mean(dim=(2, 3, 4))
+    elif gradients.dim() == 6:  # Case B and C
+        agg_gradients = gradients.abs().mean(dim=(2, 3, 4, 5))
+    else:
+        raise ValueError("Unexpected gradient shape")
+
+    BATCH, PATCHES = agg_gradients.shape
+
+    # Compute the moving average
+    cumsum = torch.cumsum(agg_gradients, dim=0)
+    moving_avg = (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+
+    # Compute the trend
+    X = torch.arange(window_size, BATCH, dtype=torch.float32, device=device).unsqueeze(1).expand(-1, PATCHES)
+    y = moving_avg
+
+    # Compute the slope using least squares method
+    X_mean = X.mean(dim=0, keepdim=True)
+    y_mean = y.mean(dim=0, keepdim=True)
+
+    numerator = torch.sum((X - X_mean) * (y - y_mean), dim=0)
+    denominator = torch.sum((X - X_mean) ** 2, dim=0) + epsilon
+
+    slope = numerator / denominator
+
+    tolerance = slope.std() * 0.1
+    print(f"Tolerance is {tolerance}")
+
+    # Determine convergence or divergence
+    stable = (slope.abs() <= tolerance)
+
+    convergence = (slope < 0) & ~stable
+    divergence = (slope > 0) & ~stable
+
+    # Select diverging or stable patches
+    non_converging = divergence | stable
+    non_converging_slopes = slope[non_converging]
+
+    # Get top_k elements
+    top_k_mask = torch.zeros_like(slope, dtype=torch.bool)
+    if non_converging_slopes.numel() > 0:
+        top_k = min(top_k, non_converging_slopes.numel())
+        _, top_k_indices = torch.topk(non_converging_slopes, k=top_k)
+
+        # Create boolean mask for top_k slopes
+        non_converging_indices = torch.nonzero(non_converging).squeeze()
+        if non_converging_indices.ndim == 0:
+            top_k_mask[non_converging_indices] = True
+        else:
+            top_k_mask[non_converging_indices[top_k_indices]] = True
+
+    # Plotting
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    ax_all, ax_diverging, ax_converging, ax_stable = axes.flatten()
+
+    for patch in range(PATCHES):
+        ax_all.plot(moving_avg[:, patch].cpu(), label=f'Patch {patch}' if top_k_mask[patch].item() else None, alpha=0.5)
+        if divergence[patch]:
+            ax_diverging.plot(moving_avg[:, patch].cpu(), label=f'Patch {patch}', alpha=0.5, color='red')
+        if convergence[patch]:
+            ax_converging.plot(moving_avg[:, patch].cpu(), label=f'Patch {patch}', alpha=0.5, color='green')
+        if stable[patch]:
+            ax_stable.plot(moving_avg[:, patch].cpu(), label=f'Patch {patch}', alpha=0.5, color='blue')
+    # ax.set_title(f'Gradient Trend Analysis per Patch for {param_group_name}, and init LR: {lr}')
+    # ax.set_xlabel('Batch Index')
+    # ax.set_ylabel(f'Gradient Moving Average (window size: {window_size})')
+    # ax.legend(loc='upper right')
+
+    ax_all.set_title(f'Gradient Trend Analysis per Patch for {param_group_name}, and init LR: {lr}')
+    ax_all.set_xlabel('Batch Index')
+    ax_all.set_ylabel(f'Gradient Moving Average (window size: {window_size})')
+    ax_all.legend(loc='upper right')
+
+    ax_diverging.set_title('Diverging Patches')
+    ax_diverging.set_xlabel('Batch Index')
+    ax_diverging.set_ylabel('Gradient Moving Average')
+
+    ax_converging.set_title('Converging Patches')
+    ax_converging.set_xlabel('Batch Index')
+    ax_converging.set_ylabel('Gradient Moving Average')
+
+    ax_stable.set_title('Stable Patches')
+    ax_stable.set_xlabel('Batch Index')
+    ax_stable.set_ylabel('Gradient Moving Average')
+
+    plt.tight_layout()
+    plt.show()
+    # # Log to wandb
+    # wandb.log({
+    #     "converging": wandb.Histogram(convergence.cpu().numpy()),
+    #     "diverging": wandb.Histogram(divergence.cpu().numpy()),
+    #     "stable": wandb.Histogram(stable.cpu().numpy()),
+    #     "non_converging": wandb.Histogram(non_converging.cpu().numpy()),
+    #     "slope": wandb.Histogram(slope.cpu().numpy()),
+    #     "top_k_mask": wandb.Histogram(top_k_mask.cpu().numpy())
+    # })
+    return {
+        "converging": convergence,
+        "diverging": divergence,
+        "stable": stable,
+        "non_converging": non_converging,
+        "slope": slope,
+        "top_k_mask": top_k_mask
+    }
+
+
+def analyze_gradient_trend_per_patch1(gradients, window_size=128, top_k=5, device='cuda', param_group_name='', lr=0):
+    # Aggregate gradients across all dimensions except BATCH and PATCHES
+    if gradients.dim() == 5:  # Case A
+        agg_gradients = gradients.abs().mean(dim=(2, 3, 4))
+    elif gradients.dim() == 6:  # Case B and C
+        agg_gradients = gradients.abs().mean(dim=(2, 3, 4, 5))
+    else:
+        raise ValueError("Unexpected gradient shape")
+
+    BATCH, PATCHES = agg_gradients.shape
+
+    # Compute the moving average
+    cumsum = torch.cumsum(agg_gradients, dim=0)
+    moving_avg = (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+
+    # Compute the trend
+    X = torch.arange(window_size, BATCH, dtype=torch.float32, device=device).unsqueeze(1).expand(-1, PATCHES)
+    y = moving_avg
+
+    # Compute the slope using least squares method
+    X_mean = X.mean(dim=0, keepdim=True)
+    y_mean = y.mean(dim=0, keepdim=True)
+
+    numerator = torch.sum((X - X_mean) * (y - y_mean), dim=0)
+    denominator = torch.sum((X - X_mean) ** 2, dim=0) + 1e-8  # Regularization term added
+
+    slope = numerator / denominator
+
+    # Determine convergence or divergence
+    convergence = slope < 0
+    divergence = slope > 0
+    stable = slope == 0
+
+    # Select diverging or stable patches
+    non_converging = divergence | stable
+    non_converging_slopes = slope[non_converging]
+
+    # Get top_k elements
+    top_k_mask = torch.zeros_like(slope, dtype=torch.bool)
+    if non_converging_slopes.numel() > 0:
+        top_k = min(top_k, non_converging_slopes.numel())
+        _, top_k_indices = torch.topk(non_converging_slopes, k=top_k)
+
+        # Create boolean mask for top_k slopes
+        non_converging_indices = torch.nonzero(non_converging).squeeze()
+        if non_converging_indices.ndim == 0:
+            top_k_mask[non_converging_indices] = True
+        else:
+            top_k_mask[non_converging_indices[top_k_indices]] = True
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(12, 8))
+    for patch in range(PATCHES):
+        ax.plot(moving_avg[:, patch].cpu(), label=f'Patch {patch}' if top_k_mask[patch].item() else None, alpha=0.5)
+
+    converging_patches = torch.nonzero(convergence).squeeze().cpu().tolist()
+    diverging_patches = torch.nonzero(divergence).squeeze().cpu().tolist()
+    stable_patches = torch.nonzero(stable).squeeze().cpu().tolist()
+
+    if converging_patches:
+        ax.plot([], [], label='Converging', color='green')
+    if diverging_patches:
+        ax.plot([], [], label='Diverging', color='red')
+    if stable_patches:
+        ax.plot([], [], label='Stable', color='blue')
+
+    ax.set_title(f'Gradient Trend Analysis per Patch for {param_group_name}, and init LR: {lr}')
+    ax.set_xlabel('Batch Index')
+    ax.set_ylabel(f'Gradient Moving Average (window size: {window_size})')
+    ax.legend(loc='upper right')
+    plt.show()
+
+    return {
+        "converging": convergence,
+        "diverging": divergence,
+        "stable": stable,
+        "non_converging": non_converging,
+        "slope": slope,
+        "top_k_mask": top_k_mask
+    }
 
 
 
-def analyze_gradient_trend_per_patch(gradients, window_size=5, top_k=5, device='cuda'):
+def analyze_gradient_trend_per_patch2(gradients, window_size=64, top_k=5, device='cuda'):
     # Aggregate gradients across all dimensions except BATCH and PATCHES
     if gradients.dim() == 5:  # Case A
         agg_gradients = gradients.abs().mean(dim=(2, 3, 4))
@@ -433,6 +535,7 @@ def analyze_gradient_trend_per_patch(gradients, window_size=5, top_k=5, device='
         "converging": convergence,
         "diverging": divergence,
         "stable": stable,
+        "non_converging": non_converging,
         "slope": slope,
         "top_k_mask": top_k_mask
     }

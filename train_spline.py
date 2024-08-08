@@ -5,17 +5,16 @@
 #
 # This software is free for non-commercial, research and evaluation use 
 # under the terms of the LICENSE.md file.
-#
 
 import os
-
+import yaml
 import imageio
 import matplotlib.pyplot as plt
 from random import randint
-from utils.loss_utils import l1_loss, ssim, pw_cosine_similarity
-from gaussian_renderer import render, network_gui, render_spline
+from utils.loss_utils import l1_loss, ssim, TV_loss, TV_SH_loss
+from gaussian_renderer import network_gui, render_spline, render_modify
 from scene import Scene, SplineScene
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, inverse_sigmoid
 import uuid
 import sys
 from tqdm import tqdm
@@ -23,14 +22,38 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.data import *
-from model import SplineModel
-torch.autograd.set_detect_anomaly(True)
+from model import SplineModel, Gaussians
+import wandb
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
+api_key = os.getenv('WANDB_API')
+wandb.login(key=api_key)
+wandb.init(project="Splines", entity='tzlil')
+NUM_VIEWS = 0
+
+
+
+class SplineConfig:
+    def __init__(self, **entries):
+        self.__dict__.update(entries)
+
+    def __getattr__(self, name):
+        return self.__dict__.get(name, None)
+# Helper function to convert types
+
+
+# Function to log images
+def wandb_logger(predicted_image, gt_image, iteration, num_patches, loss, psnr_score, ssim_score):
+    wandb.log({f"Reconstructed Image (PSNR: {psnr_score}, SSIM: {ssim_score})": wandb.Image(predicted_image,
+                                                                                caption=f"Iteration {iteration}")})
+    wandb.log({"Ground Truth Image": wandb.Image(gt_image, caption=f"Iteration {iteration}")})
+    # Log other metrics
+    wandb.log({
+        "num_patches": num_patches,
+        "Loss": loss,
+        "PSNR": psnr_score,
+        "SSIM": ssim_score
+    }, step=iteration)
+
 
 
 def render_view(images):
@@ -45,38 +68,37 @@ def render_view(images):
 def tensor_to_numpy(image_tensor):
     # Assuming image_tensor is of shape (C, H, W) and values are in the range [0, 1]
     image_np = image_tensor.permute(1, 2, 0).detach().cpu().numpy()  # Convert to (H, W, C) and move to CPU
-    image_np = np.clip((image_np * 255),a_min=0, a_max=255).astype(np.uint8) # Convert to uint8
+    image_np = np.clip((image_np * 255), a_min=0, a_max=255).astype(np.uint8) # Convert to uint8
 
     return image_np
-def render_scene(scene, gaussians, pipe, bg, iteration=None):
-    # if not viewpoint_stack:
-    writer = imageio.get_writer(os.path.join("experiments/tpot3", f'scene2_360_after_{iteration}_iter.mp4'), fps=4)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+def render_patches_individually(gaussians: Gaussians, num_patches, viewpoint, renderArgs):
 
-    while len(viewpoint_stack) - 1 > 0:
-        viewpoint_cam = viewpoint_stack.pop()
-
-        # Render
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], \
-            render_pkg["visibility_filter"], render_pkg["radii"]
-        # Add images to the video writer
-        writer.append_data(tensor_to_numpy(image))
-
-    writer.close()
+    opacity = gaussians.opacity.reshape(num_patches, -1)
+    for p in range(num_patches):
+        masked_opacity = torch.zeros_like(opacity) + 0.0001
+        masked_opacity[p] = 1.
+        masked_opacity = inverse_sigmoid(masked_opacity.reshape(-1, 1))
+        masked_gaussians = Gaussians(gaussians.xyz, gaussians.features, torch.exp(gaussians.scaling), torch.sigmoid(masked_opacity), torch.nn.functional.normalize(gaussians.rotation), gaussians.active_sh_degree)
+        image = render_modify(viewpoint, masked_gaussians, *renderArgs)["render"]
+        wandb.log({f"Focus on Patch": wandb.Image(image, caption=f"Patch ID {p}")})
 
 
 def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint_iterations, debug_from):
+    # Load configuration from YAML file
+    with open('config/spline_config.yaml', 'r') as file:
+        config = yaml.safe_load(file)
+
+    config = SplineConfig(**config)
     first_iter = 0
-    device = 'cuda'
+    torch.cuda.empty_cache()
+
     # Load Spline reference scene
     file_path = 'experiments/bpt-data/teapot.txt'
     file_content = read_bpt_file(file_path)
     patches = parse_bpt(file_content)
-    splines = SplineModel(patches, device=device, resolution=6)
+    splines = SplineModel(patches, config=config)
 
-    tb_writer = prepare_output_and_logger(dataset)
     scene = SplineScene(dataset, splines)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -92,15 +114,14 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint
     step_interval = splines.step_size
     splines.sample_gaussians()
     loss = torch.tensor([0], dtype=torch.float32, device="cuda")
-
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
-        if iteration in [3500, 6000, 9000, 12000]:
+        if iteration in [3500, 7000, 14000, 18000]:
             splines.oneupSHdegree()
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = scene.getTrainCameras(num_cameras=NUM_VIEWS).copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
         # Render
@@ -115,15 +136,17 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint
         gt_image = viewpoint_cam.original_image.cuda()
 
         Ll1 = l1_loss(image, gt_image)
-        # L_geo = pw_cosine_similarity(splines.surface_normals, splines.areas, weight=.1)
+        L_TV = TV_loss(splines.get_dus, splines.get_dvs) + TV_loss(splines.get_ddus, splines.get_ddvs)
+        L_TV_SH = TV_SH_loss(splines.sh_features.flatten(start_dim=-2))
         ssim_term = (1.0 - ssim(image, gt_image))
-        loss += ((1 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_term) #+ L_geo
+        alpha = 1e-2 / iteration**0.5 if iteration < config.stop_splitting else 0
+        beta = 1e-5 / iteration if iteration < config.stop_splitting else 0
+        loss += ((1 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_term) + alpha*L_TV_SH + beta*L_TV
 
         if not iteration % step_interval:
             loss.backward()
             splines.step(iteration, visibility_filter)
-            loss = torch.tensor([0], dtype=torch.float32, device="cuda")
-            if iteration % splines.splitting_interval_every == 0 and iteration <= 7000:
+            if iteration % splines.split_every == 0 and config.start_splitting_from <= iteration <= config.stop_splitting:
                 splines.patch_upsampler()
             splines.sample_gaussians()
         iter_end.record()
@@ -132,7 +155,6 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint
             if iteration % 500 == 1:
                 compare_gt2splat(gt_image, image, viewpoint_cam)
 
-            # splines.scale_shaking(iteration)
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -143,7 +165,8 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, checkpoint
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((splines.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-            spline_training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, splines, render_spline, (pipe, background))
+            spline_training_report(image, gt_image, iteration, Ll1, ssim_term, loss, testing_iterations, scene, splines, render_spline, (pipe, background))
+            loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
 
 def compare_gt2splat(gt_image, image, viewpoint_cam):
@@ -173,39 +196,26 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
 
-
-def spline_training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, splines, renderFunc, renderArgs):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+def spline_training_report(image, gt_image, iteration, Ll1, ssim_term, loss, testing_iterations, scene : Scene, splines, renderFunc, renderArgs):
 
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras': [scene.getTestCameras()[1]]},
                               {'name': 'train',
-                               'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+                               'cameras': scene.getTrainCameras()[:NUM_VIEWS]})
+                               # 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 ssim_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, splines, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    image = renderFunc(viewpoint, splines, *renderArgs)["render"]
+                    # image = torch.clamp(renderFunc(viewpoint, splines, *renderArgs)["render"], 0.0, 1.0)
+                    # gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = viewpoint.original_image.to("cuda")
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
@@ -213,15 +223,9 @@ def spline_training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, te
                 ssim_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
             print("\n[ITER {}] Evaluating {}: SSIM {}, L1 {} PSNR {}".format(iteration, config['name'], ssim_test, l1_test, psnr_test))
-            if tb_writer:
-                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", splines.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', splines.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
-
+        wandb_logger(image, gt_image, iteration, splines.num_patches, loss, psnr_test, ssim_test)
+        render_patches_individually(splines.gaussians, splines.num_patches, scene.getTrainCameras()[0], renderArgs)
 
 def main():
     # Set up command line argument parser

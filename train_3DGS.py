@@ -211,7 +211,7 @@ def spline_splatting_training(dataset, opt, pipe, testing_iterations, saving_ite
             loss.backward()
             splines.step(iteration, visibility_filter)
             loss = torch.tensor([0], dtype=torch.float32, device="cuda")
-            if iteration % splines.splitting_interval_every == 0 and iteration < 7000:
+            if iteration % splines.split_every == 0 and iteration < 7000:
                 splines.patch_upsampler()
             splines.sample_gaussians()
 

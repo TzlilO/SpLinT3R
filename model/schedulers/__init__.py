@@ -6,7 +6,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 class DecayingCosineAnnealingWarmRestarts(_LRScheduler):
     def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, last_epoch=-1, alpha=0.5, beta=0.5,
-                 verbose=False, start_decay_cycle=0, stop_decay_cycle=float('inf')):
+                 verbose=False, start_decay_cycle=0, stop_decay_cycle=float('inf'), valid_groups=['f_rest', 'scale_params']):
         """
         Args:
             optimizer (Optimizer): Wrapped optimizer.
@@ -44,7 +44,7 @@ class DecayingCosineAnnealingWarmRestarts(_LRScheduler):
         self.verbose = verbose
         self.start_decay_cycle = start_decay_cycle
         self.stop_decay_cycle = stop_decay_cycle
-
+        self.valid_param_groups = valid_groups
         self.base_max_lrs = [group['lr'] for group in optimizer.param_groups]
         self.eta_min = self.base_eta_min
         self.base_lrs = [lr for lr in self.base_max_lrs]
@@ -104,6 +104,8 @@ class DecayingCosineAnnealingWarmRestarts(_LRScheduler):
 
         new_lrs = self.get_lr()
         for param_group, lr in zip(self.optimizer.param_groups, new_lrs):
+            if param_group['name'] not in self.valid_param_groups:
+                continue
             param_group['lr'] = lr
 
         if self.verbose:
